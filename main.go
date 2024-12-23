@@ -4,7 +4,9 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -28,6 +30,128 @@ type Appointment struct {
 type Task struct {
 	Title     string
 	Completed bool
+}
+
+// Benutzerdefinierter Entry für Datumsauswahl
+type DateEntry struct {
+	widget.Entry
+	window       fyne.Window
+	justSelected bool // Flag für die Datumsauswahl
+}
+
+func NewDateEntry(window fyne.Window) *DateEntry {
+	entry := &DateEntry{window: window}
+	entry.ExtendBaseWidget(entry)
+	entry.SetText("Klicken für Datumsauswahl")
+	return entry
+}
+
+func (e *DateEntry) FocusGained() {
+	if e.justSelected {
+		e.justSelected = false
+		e.Entry.FocusGained()
+		return
+	}
+
+	// Prüfe ob Zenity installiert ist
+	if _, err := exec.LookPath("zenity"); err != nil {
+		dialog.ShowError(fmt.Errorf("Zenity ist nicht installiert. Bitte installieren Sie es mit 'sudo apt-get install zenity'"), e.window)
+		return
+	}
+
+	cmd := exec.Command("zenity", "--calendar", "--date-format=%Y-%m-%d")
+	output, err := cmd.CombinedOutput()
+
+	// Ignoriere bestimmte Fehler (exit status 1 bei Abbruch)
+	if err != nil && !strings.Contains(err.Error(), "exit status 1") {
+		dialog.ShowError(fmt.Errorf("Fehler beim Ausführen von Zenity"), e.window)
+		return
+	}
+
+	// Extrahiere nur das Datum aus der Ausgabe
+	outputStr := string(output)
+	// Suche nach einem Datum im Format YYYY-MM-DD
+	datePattern := regexp.MustCompile(`\d{4}-\d{2}-\d{2}`)
+	if match := datePattern.FindString(outputStr); match != "" {
+		e.justSelected = true
+		e.SetText(match)
+	}
+
+	e.Entry.FocusGained()
+}
+
+// Benutzerdefinierter Entry für Zeitauswahl
+type TimeEntry struct {
+	widget.Entry
+	window       fyne.Window
+	justSelected bool
+}
+
+func NewTimeEntry(window fyne.Window) *TimeEntry {
+	entry := &TimeEntry{window: window}
+	entry.ExtendBaseWidget(entry)
+	entry.SetText("Klicken für Zeitauswahl")
+	return entry
+}
+
+func (e *TimeEntry) FocusGained() {
+	if e.justSelected {
+		e.justSelected = false
+		e.Entry.FocusGained()
+		return
+	}
+
+	// Prüfe ob YAD installiert ist
+	if _, err := exec.LookPath("yad"); err != nil {
+		dialog.ShowError(fmt.Errorf("YAD ist nicht installiert. Bitte installieren Sie es mit 'sudo apt-get install yad'"), e.window)
+		return
+	}
+
+	// Erstelle die Stunden- und Minutenlisten
+	hours := make([]string, 24)
+	for i := 0; i < 24; i++ {
+		hours[i] = fmt.Sprintf("%02d", i)
+	}
+	minutes := make([]string, 60)
+	for i := 0; i < 60; i++ {
+		minutes[i] = fmt.Sprintf("%02d", i)
+	}
+
+	// Erstelle die Kommandozeile für YAD
+	hoursStr := strings.Join(hours, "!")
+	minutesStr := strings.Join(minutes, "!")
+
+	cmd := exec.Command("yad", "--title=Zeit auswählen",
+		"--form",
+		"--field=Stunde:CB", hoursStr,
+		"--field=Minute:CB", minutesStr,
+		"--button=Auswählen:0",
+		"--button=Abbrechen:1",
+		"--width=300",
+		"--height=150")
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// Ignoriere den Fehler wenn der Benutzer abbricht
+		if !strings.Contains(err.Error(), "exit status 1") {
+			errMsg := fmt.Sprintf("Fehler beim Ausführen von YAD: %v\nOutput: %s", err, string(output))
+			dialog.ShowError(fmt.Errorf(errMsg), e.window)
+		}
+		return
+	}
+
+	// Verarbeite die Ausgabe
+	result := strings.TrimSpace(string(output))
+	parts := strings.Split(result, "|")
+	if len(parts) >= 2 {
+		hour := strings.TrimSpace(parts[0])
+		minute := strings.TrimSpace(parts[1])
+		timeStr := fmt.Sprintf("%s:%s", hour, minute)
+		e.justSelected = true
+		e.SetText(timeStr)
+	}
+
+	e.Entry.FocusGained()
 }
 
 var (
@@ -69,18 +193,8 @@ func initDB() {
 // Funktion zum Hinzufügen eines Termins
 func addAppointment(myWindow fyne.Window) {
 	titleEntry := widget.NewEntry()
-	timeEntry := widget.NewEntry()
-	// Wenn ins Zeitfeld geklickt wird, öffnen wir Zenity
-	timeEntry.OnTapped = func() {
-		cmd := exec.Command("zenity", "--calendar", "--date-format=%Y-%m-%d")
-		output, err := cmd.Output()
-		if err != nil {
-			dialog.ShowError(err, myWindow)
-			return
-		}
-		// Setze das ausgewählte Datum in das Feld
-		timeEntry.SetText(strings.TrimSpace(string(output)))
-	}
+	dateEntry := NewDateEntry(myWindow)
+	timeEntry := NewTimeEntry(myWindow)
 
 	// Erstelle ComboBox für Priorität
 	prioritySelect := widget.NewSelect([]string{"1", "2", "3"}, nil)
@@ -88,12 +202,15 @@ func addAppointment(myWindow fyne.Window) {
 
 	dialog.ShowForm("Neuen Termin hinzufügen", "Hinzufügen", "Abbrechen", []*widget.FormItem{
 		widget.NewFormItem("Titel", titleEntry),
-		widget.NewFormItem("Datum", timeEntry),
+		widget.NewFormItem("Datum", dateEntry),
+		widget.NewFormItem("Uhrzeit", timeEntry),
 		widget.NewFormItem("Priorität", prioritySelect),
 	}, func(submitted bool) {
 		if submitted {
 			title := titleEntry.Text
-			time := timeEntry.Text
+
+			// Kombiniere Datum und Zeit
+			dateTime := dateEntry.Text + " " + timeEntry.Text
 
 			// Priorität aus ComboBox
 			var priority *int
@@ -104,14 +221,23 @@ func addAppointment(myWindow fyne.Window) {
 
 			// Speichern des Termins in der Datenbank
 			_, err := db.Exec("INSERT INTO appointments (title, time, priority) VALUES (?, ?, ?)",
-				title, time, priority)
+				title, dateTime, priority)
 			if err != nil {
 				log.Printf("Fehler beim Speichern des Termins: %v", err)
 				dialog.ShowInformation("Fehler", "Fehler beim Speichern des Termins: "+err.Error(), myWindow)
 				return
 			}
 			dialog.ShowInformation("Termin hinzugefügt",
-				fmt.Sprintf("Titel: %s\nDatum: %s\nPriorität: %v", title, time, priority),
+				fmt.Sprintf("Titel: %s\nDatum: %s\nUhrzeit: %s\nPriorität: %s",
+					title,
+					dateEntry.Text,
+					timeEntry.Text,
+					func() string {
+						if priority == nil {
+							return "Keine"
+						}
+						return fmt.Sprintf("%d", *priority)
+					}()),
 				myWindow)
 		}
 	}, myWindow)
@@ -176,21 +302,39 @@ func showAppointments(myWindow fyne.Window, myApp fyne.App) {
 			return len(appointmentsList), 5
 		},
 		func() fyne.CanvasObject {
-			return container.NewHBox(widget.NewLabel(""))
+			// Erstelle einen Container mit einem Label für Text-Spalten und einem Button für Aktions-Spalten
+			return container.NewHBox(
+				widget.NewLabel(""),
+				widget.NewButton("", nil), // Platzhalter für Buttons
+			)
 		},
 		func(id widget.TableCellID, cell fyne.CanvasObject) {
+			container := cell.(*fyne.Container)
+			label := container.Objects[0].(*widget.Label)
+			button := container.Objects[1].(*widget.Button)
+
+			// Standardmäßig alles ausblenden
+			label.Hide()
+			button.Hide()
+
 			if id.Col < 3 {
-				cell.(*fyne.Container).Objects[0].(*widget.Label).SetText(appointmentsList[id.Row][id.Col])
+				// Text-Spalten (Titel, Zeit, Priorität)
+				label.Show()
+				label.SetText(appointmentsList[id.Row][id.Col])
 			} else if id.Col == 3 {
-				deleteBtn := widget.NewButton("Löschen", func() {
+				// Löschen-Button
+				button.Show()
+				button.SetText("Löschen")
+				button.OnTapped = func() {
 					deleteAppointment(appointmentsList[id.Row][0], myWindow)
-				})
-				cell.(*fyne.Container).Objects = []fyne.CanvasObject{deleteBtn}
+				}
 			} else if id.Col == 4 {
-				editBtn := widget.NewButton("Ändern", func() {
+				// Ändern-Button
+				button.Show()
+				button.SetText("Ändern")
+				button.OnTapped = func() {
 					editAppointment(appointmentsList[id.Row][0], appointmentsList[id.Row][1], appointmentsList[id.Row][2], myWindow)
-				})
-				cell.(*fyne.Container).Objects = []fyne.CanvasObject{editBtn}
+				}
 			}
 		},
 	)
@@ -428,6 +572,9 @@ func refreshTasksTable() {
 }
 
 func main() {
+	// Unterdrücke Mesa-Fehlermeldungen
+	os.Setenv("MESA_DEBUG", "silent")
+
 	initDB()
 	defer db.Close()
 
