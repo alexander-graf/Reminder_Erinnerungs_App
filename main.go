@@ -9,6 +9,9 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
+
+	"Reminder_Erinnerungs_App/internal/reminder"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -74,7 +77,7 @@ func (e *DateEntry) FocusGained() {
 	datePattern := regexp.MustCompile(`\d{4}-\d{2}-\d{2}`)
 	if match := datePattern.FindString(outputStr); match != "" {
 		e.justSelected = true
-		e.SetText(match)
+		e.SetText(convertToGermanDate(match))
 	}
 
 	e.Entry.FocusGained()
@@ -162,6 +165,31 @@ var (
 	tasksList         [][]string
 )
 
+// Neue Hilfsfunktionen für die Datumskonvertierung
+func convertToGermanDate(isoDate string) string {
+	// Konvertiert von YYYY-MM-DD zu DD.MM.YYYY
+	if len(isoDate) != 10 {
+		return isoDate
+	}
+	parts := strings.Split(isoDate, "-")
+	if len(parts) != 3 {
+		return isoDate
+	}
+	return fmt.Sprintf("%s.%s.%s", parts[2], parts[1], parts[0])
+}
+
+func convertToISODate(germanDate string) string {
+	// Konvertiert von DD.MM.YYYY zu YYYY-MM-DD
+	if len(germanDate) != 10 {
+		return germanDate
+	}
+	parts := strings.Split(germanDate, ".")
+	if len(parts) != 3 {
+		return germanDate
+	}
+	return fmt.Sprintf("%s-%s-%s", parts[2], parts[1], parts[0])
+}
+
 // Funktion zum Initialisieren der Datenbank
 func initDB() {
 	var err error
@@ -175,7 +203,8 @@ func initDB() {
 	CREATE TABLE IF NOT EXISTS appointments (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		title TEXT,
-		time TEXT,
+		date TEXT,  -- Separates Datumsfeld
+		time TEXT,  -- Separates Zeitfeld
 		priority INTEGER
 	);
 	CREATE TABLE IF NOT EXISTS tasks (
@@ -196,8 +225,18 @@ func addAppointment(myWindow fyne.Window) {
 	dateEntry := NewDateEntry(myWindow)
 	timeEntry := NewTimeEntry(myWindow)
 
-	// Erstelle ComboBox für Priorität
+	// Aktuelles Datum im ISO-Format
+	now := time.Now()
+	dateEntry.SetText(convertToGermanDate(now.Format("2006-01-02")))
+
+	// Aktuelle Zeit (gerundet auf die nächste Viertelstunde)
+	roundedMinutes := ((now.Minute() + 14) / 15) * 15
+	roundedTime := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), roundedMinutes, 0, 0, now.Location())
+	timeEntry.SetText(roundedTime.Format("15:04"))
+
+	// Erstelle ComboBox für Priorität mit Vorauswahl 1
 	prioritySelect := widget.NewSelect([]string{"1", "2", "3"}, nil)
+	prioritySelect.SetSelected("1") // Setze Priorität 1 als Standard
 	prioritySelect.PlaceHolder = "Priorität wählen"
 
 	dialog.ShowForm("Neuen Termin hinzufügen", "Hinzufügen", "Abbrechen", []*widget.FormItem{
@@ -208,9 +247,8 @@ func addAppointment(myWindow fyne.Window) {
 	}, func(submitted bool) {
 		if submitted {
 			title := titleEntry.Text
-
-			// Kombiniere Datum und Zeit
-			dateTime := dateEntry.Text + " " + timeEntry.Text
+			date := convertToISODate(dateEntry.Text) // Konvertiere zurück zu ISO für DB
+			time := timeEntry.Text
 
 			// Priorität aus ComboBox
 			var priority *int
@@ -220,8 +258,8 @@ func addAppointment(myWindow fyne.Window) {
 			}
 
 			// Speichern des Termins in der Datenbank
-			_, err := db.Exec("INSERT INTO appointments (title, time, priority) VALUES (?, ?, ?)",
-				title, dateTime, priority)
+			_, err := db.Exec("INSERT INTO appointments (title, date, time, priority) VALUES (?, ?, ?, ?)",
+				title, date, time, priority)
 			if err != nil {
 				log.Printf("Fehler beim Speichern des Termins: %v", err)
 				dialog.ShowInformation("Fehler", "Fehler beim Speichern des Termins: "+err.Error(), myWindow)
@@ -230,7 +268,7 @@ func addAppointment(myWindow fyne.Window) {
 			dialog.ShowInformation("Termin hinzugefügt",
 				fmt.Sprintf("Titel: %s\nDatum: %s\nUhrzeit: %s\nPriorität: %s",
 					title,
-					dateEntry.Text,
+					dateEntry.Text, // Zeigt deutsches Format
 					timeEntry.Text,
 					func() string {
 						if priority == nil {
@@ -267,9 +305,9 @@ func addTask(myWindow fyne.Window) {
 
 // Funktion zum Anzeigen aller Termine in einem neuen Fenster
 func showAppointments(myWindow fyne.Window, myApp fyne.App) {
-	rows, err := db.Query("SELECT title, time, priority FROM appointments")
+	rows, err := db.Query("SELECT title, date, time, priority FROM appointments")
 	if err != nil {
-		log.Printf("Fehler beim Abrufen der Termine: %v", err) // Debugging-Information
+		log.Printf("Fehler beim Abrufen der Termine: %v", err)
 		dialog.ShowInformation("Fehler", "Fehler beim Abrufen der Termine: "+err.Error(), myWindow)
 		return
 	}
@@ -277,18 +315,29 @@ func showAppointments(myWindow fyne.Window, myApp fyne.App) {
 
 	var appointments [][]string
 	for rows.Next() {
-		var title, time string
-		var priority sql.NullInt64 // Verwende sql.NullInt64 für die Priority
-		if err := rows.Scan(&title, &time, &priority); err != nil {
-			log.Printf("Fehler beim Scannen der Termine: %v", err) // Debugging-Information
+		var title, date string
+		var timeStr sql.NullString
+		var priority sql.NullInt64
+		if err := rows.Scan(&title, &date, &timeStr, &priority); err != nil {
+			log.Printf("Fehler beim Scannen der Termine: %v", err)
 			dialog.ShowInformation("Fehler", "Fehler beim Scannen der Termine: "+err.Error(), myWindow)
 			return
 		}
+
+		// Setze einen Standardwert für die Zeit, wenn sie NULL ist
+		time := "Keine Zeit"
+		if timeStr.Valid {
+			time = timeStr.String
+		}
+
 		priorityValue := "Keine Priorität"
 		if priority.Valid {
 			priorityValue = fmt.Sprintf("%d", priority.Int64)
 		}
-		appointments = append(appointments, []string{title, time, priorityValue})
+
+		// Konvertiere das Datum ins deutsche Format für die Anzeige
+		germanDate := convertToGermanDate(date)
+		appointments = append(appointments, []string{title, germanDate, time, priorityValue})
 	}
 
 	if len(appointments) == 0 {
@@ -443,33 +492,69 @@ func deleteAppointment(title string, myWindow fyne.Window) {
 func editAppointment(title, time, priority string, myWindow fyne.Window) {
 	titleEntry := widget.NewEntry()
 	titleEntry.SetText(title)
-	timeEntry := widget.NewEntry()
-	timeEntry.SetText(time)
-	priorityEntry := widget.NewEntry()
-	priorityEntry.SetText(priority)
+
+	// Verwende die benutzerdefinierten Entries für Datum und Zeit
+	dateEntry := NewDateEntry(myWindow)
+	timeEntry := NewTimeEntry(myWindow)
+
+	// Wenn time ein Datum enthält, parse es und setze die Werte
+	if len(time) > 0 {
+		dateEntry.SetText(time) // Zeit wird im deutschen Format angezeigt
+		if t := strings.Split(time, " "); len(t) > 1 {
+			timeEntry.SetText(t[1])
+		}
+	}
+
+	// Erstelle ComboBox für Priorität
+	prioritySelect := widget.NewSelect([]string{"1", "2", "3"}, nil)
+	if priority != "Keine Priorität" {
+		prioritySelect.SetSelected(priority)
+	}
+	prioritySelect.PlaceHolder = "Priorität wählen"
 
 	dialog.ShowForm("Termin bearbeiten", "Speichern", "Abbrechen",
 		[]*widget.FormItem{
 			widget.NewFormItem("Titel", titleEntry),
-			widget.NewFormItem("Zeit", timeEntry),
-			widget.NewFormItem("Priorität", priorityEntry),
+			widget.NewFormItem("Datum", dateEntry),
+			widget.NewFormItem("Uhrzeit", timeEntry),
+			widget.NewFormItem("Priorität", prioritySelect),
 		},
 		func(submitted bool) {
 			if submitted {
-				// Priorität konvertieren
+				// Priorität aus ComboBox
 				var priorityInt *int
-				if priorityEntry.Text != "Keine Priorität" {
-					if p, err := strconv.Atoi(priorityEntry.Text); err == nil {
-						priorityInt = &p
-					}
+				if prioritySelect.Selected != "" {
+					p, _ := strconv.Atoi(prioritySelect.Selected)
+					priorityInt = &p
 				}
 
-				_, err := db.Exec("UPDATE appointments SET title = ?, time = ?, priority = ? WHERE title = ?",
-					titleEntry.Text, timeEntry.Text, priorityInt, title)
+				// Konvertiere das Datum zurück ins ISO-Format für die DB
+				date := convertToISODate(dateEntry.Text)
+
+				_, err := db.Exec(`
+					UPDATE appointments 
+					SET title = ?, date = ?, time = ?, priority = ? 
+					WHERE title = ?`,
+					titleEntry.Text, date, timeEntry.Text, priorityInt, title)
 				if err != nil {
 					dialog.ShowError(err, myWindow)
 					return
 				}
+
+				// Zeige Bestätigung
+				dialog.ShowInformation("Termin aktualisiert",
+					fmt.Sprintf("Titel: %s\nDatum: %s\nUhrzeit: %s\nPriorität: %s",
+						titleEntry.Text,
+						dateEntry.Text,
+						timeEntry.Text,
+						func() string {
+							if priorityInt == nil {
+								return "Keine"
+							}
+							return fmt.Sprintf("%d", *priorityInt)
+						}()),
+					myWindow)
+
 				// Aktualisiere die Tabelle
 				refreshAppointmentsTable()
 			}
@@ -522,7 +607,7 @@ func editTask(title, status string, myWindow fyne.Window) {
 
 // Hilfsfunktionen zum Aktualisieren der Tabellen
 func refreshAppointmentsTable() {
-	rows, err := db.Query("SELECT title, time, priority FROM appointments")
+	rows, err := db.Query("SELECT title, date, time, priority FROM appointments")
 	if err != nil {
 		return
 	}
@@ -530,16 +615,27 @@ func refreshAppointmentsTable() {
 
 	appointmentsList = appointmentsList[:0] // Liste leeren
 	for rows.Next() {
-		var title, time string
+		var title, date string
+		var timeStr sql.NullString
 		var priority sql.NullInt64
-		if err := rows.Scan(&title, &time, &priority); err != nil {
+		if err := rows.Scan(&title, &date, &timeStr, &priority); err != nil {
 			continue
 		}
+
+		// Setze einen Standardwert für die Zeit, wenn sie NULL ist
+		time := "Keine Zeit"
+		if timeStr.Valid {
+			time = timeStr.String
+		}
+
 		priorityValue := "Keine Priorität"
 		if priority.Valid {
 			priorityValue = fmt.Sprintf("%d", priority.Int64)
 		}
-		appointmentsList = append(appointmentsList, []string{title, time, priorityValue})
+
+		// Konvertiere das Datum ins deutsche Format für die Anzeige
+		germanDate := convertToGermanDate(date)
+		appointmentsList = append(appointmentsList, []string{title, germanDate, time, priorityValue})
 	}
 	if appointmentsTable != nil {
 		appointmentsTable.Refresh()
@@ -581,6 +677,11 @@ func main() {
 	myApp := app.New()
 	myWindow := myApp.NewWindow("Reminder App")
 	myWindow.Resize(fyne.NewSize(600, 400))
+
+	// Reminder Service nach der Fenster-Erstellung initialisieren
+	reminderService := reminder.NewReminderService(db, myWindow)
+	reminderService.Start()
+	defer reminderService.Stop()
 
 	// Positioniere das Hauptfenster auf dem zweiten Monitor (x > 1920)
 	myWindow.Show() // Fenster muss sichtbar sein, bevor wir es positionieren
