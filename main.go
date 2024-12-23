@@ -110,6 +110,11 @@ func (e *TimeEntry) FocusGained() {
 		return
 	}
 
+	// Aktuelle Zeit ermitteln
+	now := time.Now()
+	currentHour := now.Hour()
+	currentMinute := now.Minute()
+
 	// Erstelle die Stunden- und Minutenlisten
 	hours := make([]string, 24)
 	for i := 0; i < 24; i++ {
@@ -129,17 +134,22 @@ func (e *TimeEntry) FocusGained() {
 		"--field=Stunde:CB", hoursStr,
 		"--field=Minute:CB", minutesStr,
 		"--button=Auswählen:0",
-		"--button=Abbrechen:1",
+		"--button=gtk-cancel:1",
 		"--width=300",
-		"--height=150")
+		"--height=150",
+		fmt.Sprintf("--entry-text=%02d", currentHour),
+		fmt.Sprintf("--entry-text=%02d", currentMinute))
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		// Ignoriere den Fehler wenn der Benutzer abbricht
-		if !strings.Contains(err.Error(), "exit status 1") {
-			errMsg := fmt.Sprintf("Fehler beim Ausführen von YAD: %v\nOutput: %s", err, string(output))
-			dialog.ShowError(fmt.Errorf(errMsg), e.window)
+		// Wenn der Benutzer abbricht (exit status 1), behalte den vorherigen Wert bei
+		if strings.Contains(err.Error(), "exit status 1") {
+			e.justSelected = true
+			return
 		}
+		// Bei anderen Fehlern zeige eine Fehlermeldung
+		errMsg := fmt.Sprintf("Fehler beim Ausführen von YAD: %v\nOutput: %s", err, string(output))
+		dialog.ShowError(fmt.Errorf(errMsg), e.window)
 		return
 	}
 
@@ -163,6 +173,7 @@ var (
 	tasksTable        *widget.Table
 	appointmentsList  [][]string
 	tasksList         [][]string
+	reminderService   *reminder.ReminderService
 )
 
 // Neue Hilfsfunktionen für die Datumskonvertierung
@@ -395,7 +406,30 @@ func showAppointments(myWindow fyne.Window, myApp fyne.App) {
 	appointmentsTable.SetColumnWidth(4, 80)
 
 	scrollContainer := container.NewScroll(appointmentsTable)
-	content := container.NewPadded(scrollContainer)
+
+	// Erstelle den "Alle Termine löschen" Button
+	deleteAllButton := widget.NewButton("Alle Termine löschen", func() {
+		reminderService.DeleteAllAppointments()
+		refreshAppointmentsTable()
+	})
+	deleteAllButton.Importance = widget.DangerImportance
+
+	// Erstelle einen horizontalen Container für den Button (rechts ausgerichtet)
+	buttonContainer := container.NewHBox(
+		layout.NewSpacer(), // Drückt den Button nach rechts
+		deleteAllButton,
+	)
+
+	// Hauptcontainer mit Button oben und Tabelle darunter
+	content := container.NewBorder(
+		buttonContainer, // Top
+		nil,             // Bottom
+		nil,             // Left
+		nil,             // Right
+		scrollContainer, // Center (nimmt den restlichen Platz ein)
+	)
+
+	content = container.NewPadded(content)
 
 	d := dialog.NewCustom("Alle Termine", "Schließen", content, myWindow)
 	d.Resize(fyne.NewSize(800, 400))
@@ -679,7 +713,7 @@ func main() {
 	myWindow.Resize(fyne.NewSize(600, 400))
 
 	// Reminder Service nach der Fenster-Erstellung initialisieren
-	reminderService := reminder.NewReminderService(db, myWindow)
+	reminderService = reminder.NewReminderService(db, myWindow)
 	reminderService.Start()
 	defer reminderService.Stop()
 

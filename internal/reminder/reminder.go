@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
+	"os/exec"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -15,8 +17,7 @@ import (
 type ReminderService struct {
 	db             *sql.DB
 	window         fyne.Window
-	ticker         *time.Ticker
-	done           chan bool
+	stopChan       chan struct{}
 	shownReminders map[int]bool
 }
 
@@ -24,37 +25,21 @@ func NewReminderService(db *sql.DB, window fyne.Window) *ReminderService {
 	return &ReminderService{
 		db:             db,
 		window:         window,
-		done:           make(chan bool),
 		shownReminders: make(map[int]bool),
 	}
 }
 
 func (r *ReminderService) Start() {
-	r.ticker = time.NewTicker(10 * time.Second)
-	log.Println("ReminderService gestartet - prüft alle 10 Sekunden")
-
+	r.stopChan = make(chan struct{})
 	go func() {
-		resetTicker := time.NewTicker(24 * time.Hour)
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+
 		for {
 			select {
-			case <-resetTicker.C:
-				r.resetShownReminders()
-				log.Println("Liste der gezeigten Erinnerungen zurückgesetzt")
-			case <-r.done:
-				resetTicker.Stop()
-				return
-			}
-		}
-	}()
-
-	go func() {
-		for {
-			select {
-			case <-r.ticker.C:
+			case <-ticker.C:
 				r.checkAppointments()
-			case <-r.done:
-				r.ticker.Stop()
-				log.Println("ReminderService beendet")
+			case <-r.stopChan:
 				return
 			}
 		}
@@ -62,64 +47,105 @@ func (r *ReminderService) Start() {
 }
 
 func (r *ReminderService) Stop() {
-	r.done <- true
+	r.stopChan <- struct{}{}
 }
 
 func (r *ReminderService) checkAppointments() {
-	// Aktuelle Zeit + 5 Minuten
-	checkTime := time.Now().Add(5 * time.Minute)
-
-	// Debug-Ausgabe der Prüfzeit
-	log.Printf("Prüfe Termine für: %s", checkTime.Format("2006-01-02 15:04"))
-
-	// SQL-Query mit Debug-Ausgabe
-	query := `
-        SELECT id, title, date, time, priority 
-        FROM appointments 
-        WHERE datetime(date || ' ' || time) = datetime(?, ?)`
-	queryTime := checkTime.Format("2006-01-02")
-	queryMinute := checkTime.Format("15:04")
-
-	log.Printf("SQL Query: %s mit Parametern: date=%s, time=%s", query, queryTime, queryMinute)
-
-	rows, err := r.db.Query(query, queryTime, queryMinute)
+	now := time.Now()
+	rows, err := r.db.Query(`
+		SELECT id, title, date, time, priority 
+		FROM appointments 
+		WHERE date = ? 
+		AND time IS NOT NULL`,
+		now.Format("2006-01-02"))
 	if err != nil {
-		log.Printf("Fehler bei der Terminabfrage: %v", err)
+		log.Printf("Fehler beim Abrufen der Termine: %v", err)
 		return
 	}
 	defer rows.Close()
 
-	// Debug-Ausgabe der gefundenen Termine
-	var count int
 	for rows.Next() {
-		count++
 		var id int
-		var title, date string
-		var timeStr sql.NullString
+		var title string
+		var date string
+		var timeStr string
 		var priority sql.NullInt64
 		if err := rows.Scan(&id, &title, &date, &timeStr, &priority); err != nil {
-			log.Printf("Fehler beim Scannen eines Termins: %v", err)
+			log.Printf("Fehler beim Scannen der Termine: %v", err)
 			continue
 		}
 
-		// Überprüfe, ob die Zeit gültig ist
-		if !timeStr.Valid {
-			log.Printf("Überspringe Termin ID=%d: Keine gültige Zeit", id)
+		// Parse appointment time
+		appointmentTime, err := time.Parse("15:04", timeStr)
+		if err != nil {
+			log.Printf("Fehler beim Parsen der Zeit: %v", err)
 			continue
 		}
 
-		if !r.shownReminders[id] {
-			log.Printf("Zeige Erinnerung für Termin: ID=%d, Titel=%s, Datum=%s, Zeit=%s, Priorität=%v",
-				id, title, date, timeStr.String, priority)
-			r.shownReminders[id] = true
-			r.showReminder(id, title, date, timeStr.String, priority)
-		} else {
-			log.Printf("Erinnerung für Termin ID=%d wurde bereits gezeigt", id)
+		// Convert to full timestamp for today
+		appointmentDateTime := time.Date(
+			now.Year(), now.Month(), now.Day(),
+			appointmentTime.Hour(), appointmentTime.Minute(),
+			0, 0, now.Location())
+
+		// Calculate time difference
+		diff := appointmentDateTime.Sub(now)
+		diffMinutes := int(diff.Minutes())
+
+		// Exakt zum Termin (0-1 Minute Differenz)
+		if diffMinutes >= 0 && diffMinutes < 1 {
+			// Formatiere die Zeit für die Anzeige
+			formattedTime := appointmentTime.Format("15:04")
+			formattedDate := now.Format("02.01.2006")
+			notificationText := fmt.Sprintf("%s, %s, %s", title, formattedTime, formattedDate)
+			go r.showZenityNotification(notificationText, "", priority)
+		}
+		// 5-Minuten-Vorwarnung
+		if diffMinutes >= 4 && diffMinutes < 5 {
+			go r.showReminder(id, title, date, timeStr, priority)
+		}
+	}
+}
+
+func (r *ReminderService) showZenityNotification(title string, timing string, priority sql.NullInt64) {
+	priorityText := ""
+	if priority.Valid {
+		priorityText = fmt.Sprintf("\nPriorität: %d", priority.Int64)
+	}
+
+	message := fmt.Sprintf("%s\n%s%s", title, timing, priorityText)
+
+	// Hole die aktuelle Umgebung
+	env := os.Environ()
+
+	// Versuche verschiedene DISPLAY Werte
+	displays := []string{":0", ":0.0", ":1", ":1.0"}
+
+	for _, display := range displays {
+		cmd := exec.Command("zenity", "--info",
+			"--title=Terminerinnerung!",
+			"--text="+message,
+			"--width=400",
+			"--height=200")
+
+		// Setze die komplette Umgebung inkl. DISPLAY
+		cmd.Env = append(env, "DISPLAY="+display)
+
+		if err := cmd.Run(); err == nil {
+			// Wenn erfolgreich, breche die Schleife ab
+			return
 		}
 	}
 
-	if count == 0 {
-		log.Printf("Keine Termine in 5 Minuten gefunden")
+	// Fallback: Wenn Zenity nicht funktioniert, verwende notify-send
+	fallbackCmd := exec.Command("notify-send",
+		"--urgency=critical",
+		"--app-name=Terminerinnerung",
+		"Terminerinnerung",
+		message)
+
+	if err := fallbackCmd.Run(); err != nil {
+		log.Printf("Fehler beim Anzeigen der Benachrichtigung: %v", err)
 	}
 }
 
@@ -210,9 +236,9 @@ func (r *ReminderService) postponeAppointment(id int, minutes int) {
 
 	// Update mit den neuen Werten
 	_, err = r.db.Exec(`
-        UPDATE appointments 
-        SET time = ?
-        WHERE id = ?`,
+		UPDATE appointments 
+		SET time = ?
+		WHERE id = ?`,
 		newDateTime.Format("15:04"),
 		id)
 	if err != nil {
@@ -237,4 +263,34 @@ func (r *ReminderService) rescheduleAppointment(id int, title string) {
 
 func (r *ReminderService) resetShownReminders() {
 	r.shownReminders = make(map[int]bool)
+}
+
+func (r *ReminderService) DeleteAllAppointments() error {
+	// Dialog zur Bestätigung
+	confirmDialog := dialog.NewConfirm(
+		"Alle Termine löschen",
+		"Möchten Sie wirklich alle Termine unwiderruflich löschen?",
+		func(confirm bool) {
+			if confirm {
+				// Führe das Löschen durch
+				_, err := r.db.Exec("DELETE FROM appointments")
+				if err != nil {
+					dialog.ShowError(fmt.Errorf("Fehler beim Löschen aller Termine: %v", err), r.window)
+					return
+				}
+
+				// Zeige Bestätigung
+				dialog.ShowInformation("Erfolg", "Alle Termine wurden gelöscht.", r.window)
+
+				// Setze die shownReminders zurück
+				r.resetShownReminders()
+			}
+		},
+		r.window,
+	)
+	confirmDialog.SetDismissText("Abbrechen")
+	confirmDialog.SetConfirmText("Ja, alle löschen")
+	confirmDialog.Show()
+
+	return nil
 }
