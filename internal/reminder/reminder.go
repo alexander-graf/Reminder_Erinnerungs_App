@@ -147,9 +147,26 @@ func (r *ReminderService) showZenityNotification(title string, timing string, pr
 	if err := fallbackCmd.Run(); err != nil {
 		log.Printf("Fehler beim Anzeigen der Benachrichtigung: %v", err)
 	}
+
+	// Wenn keine GUI verfügbar ist, logge zusätzlich
+	if r.window == nil {
+		log.Printf("Termin: %s", message)
+	}
 }
 
 func (r *ReminderService) showReminder(id int, title, date, timeStr string, priority sql.NullInt64) {
+	// Wenn kein Fenster verfügbar ist, zeige nur die Zenity-Benachrichtigung
+	if r.window == nil {
+		priorityStr := "Keine"
+		if priority.Valid {
+			priorityStr = fmt.Sprintf("%d", priority.Int64)
+		}
+		message := fmt.Sprintf("Termin in 5 Minuten:\n%s\nDatum: %s\nZeit: %s\nPriorität: %s",
+			title, date, timeStr, priorityStr)
+		r.showZenityNotification(message, "", priority)
+		return
+	}
+
 	priorityStr := "Keine"
 	if priority.Valid {
 		priorityStr = fmt.Sprintf("%d", priority.Int64)
@@ -266,6 +283,16 @@ func (r *ReminderService) resetShownReminders() {
 }
 
 func (r *ReminderService) DeleteAllAppointments() error {
+	// Wenn kein Fenster verfügbar ist, führe die Operation direkt aus
+	if r.window == nil {
+		_, err := r.db.Exec("DELETE FROM appointments")
+		if err != nil {
+			return fmt.Errorf("Fehler beim Löschen aller Termine: %v", err)
+		}
+		r.resetShownReminders()
+		return nil
+	}
+
 	// Dialog zur Bestätigung
 	confirmDialog := dialog.NewConfirm(
 		"Alle Termine löschen",

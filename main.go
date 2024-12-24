@@ -723,7 +723,7 @@ func main() {
 	x, y := 2000, 200 // x > 1920 für zweiten Monitor
 	myWindow.Canvas().Content().Move(fyne.NewPos(float32(x), float32(y)))
 
-	hello := widget.NewLabel("Hello Fyne!")
+	hello := widget.NewLabel("Reminder - Erinnerungs - App!")
 	content := container.New(layout.NewVBoxLayout(),
 		hello,
 		widget.NewButton("Neuen Termin hinzufügen", func() {
